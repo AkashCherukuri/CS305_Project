@@ -8,7 +8,7 @@ A repository containing the code for our course project
 Akash Cherukuri | 190050009 | Presentation slides and plotting scripts
 Battepati Karthikeya | 190050026 | Reviewing Papers, Running Experiments, Video presentation
 Mastansha Rajulapudi |  190050098 | Presentation slides and Video editing
-Sudhansh Peddabomma | 190050118 | Transcript , Video editing, and reviewing results
+Sudhansh Peddabomma | 190050118 | Transcript , Video editing and reviewing results
 Thivesh Chandra | 190050124 | Tinkering with code, Running Experiments and analysing plots
 
 
