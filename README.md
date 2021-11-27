@@ -14,4 +14,4 @@ Thivesh Chandra | 190050124 | Tinkering with code, Running Experiments and analy
 
 Our project is about analysing different BTB modules with different Branch Predictors.
 
-The Results Folder contains the results of the runs we have done and it also contains python codes to plot graphs from the results obtained.
+The Project/Results Folder contains the results of the experiments we have done and it also contains python codes to plot graphs from the results obtained.
