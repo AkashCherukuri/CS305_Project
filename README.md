@@ -5,7 +5,7 @@ A repository containing the code for our course project
 # Members and their contributions
  Team Member Name | Roll Number | Contribution 
  ---  | --- | ---
-Akash Cherukuri | 190050009 | Presentation slides and plotting scripts
+Akash Cherukuri | 190050009 | Presentation slides, Python code for plotting graphs, Video presentation
 Battepati Karthikeya | 190050026 | Reviewing Papers, Running Experiments, Video presentation
 Mastansha Rajulapudi |  190050098 | Presentation slides, Video editing and reviewing results
 Sudhansh Peddabomma | 190050118 | Transcript , Video editing and reviewing results
