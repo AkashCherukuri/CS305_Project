@@ -9,5 +9,5 @@ Akash Cherukuri | 190050009 | Presentation slides and plots
 Battepati Karthikeya | 190050026 | Running Experiments, Video presentation
 Mastansha Rajulapudi |  190050098 | Presentation slides
 Sudhansh Peddabomma | 190050118 | Transcripts
-Thivesh Chandra | 190050124 | Running Experiments
+Thivesh Chandra | 190050124 | Running Experiments and plots
 
