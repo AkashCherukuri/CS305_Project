@@ -1,0 +1,17 @@
+
+*** ChampSim Multicore Out-of-Order Simulator ***
+
+Warmup Instructions: 10000000
+Simulation Instructions: 10000000
+Number of CPUs: 1
+LLC sets: 2048
+LLC ways: 16
+Off-chip DRAM Size: 4096 MB Channels: 1 Width: 64-bit Data Rate: 6400 MT/s
+CPU 0 runs ipc1_public_traces/client_001.champsimtrace.xz
+.xz
+ITLB has LRU replacement policy
+DTLB has LRU replacement policy
+STLB has LRU replacement policy
+SN4L + DIS + BTB Prefetcher for L1I CPU 0
+client_001.cond
+hashed_perceptron-div_conq-ipcp_isca-ipcp_isca-no-no-no-no-lru-lru-lru-srrip-drrip-lru-lru-lru-1core: prefetcher/l1i_prefetcher.cc:314: void O3_CPU::l1i_prefetcher_initialize(): Assertion `rw == sizeof(e)' failed.
