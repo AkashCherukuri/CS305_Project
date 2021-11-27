@@ -1,0 +1,671 @@
+#include "div_conq.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <fstream>
+#include <list>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+DNC L1IPrefetcher;
+
+uint32_t BTB_PREFETCH_BUFFER::check_hit(uint32_t cpu, uint64_t trigger,
+                                        uint8_t branch_type) {
+  uint32_t set = (trigger >> 2) & ((1 << lg2(BTB_PREFETCH_BUFFER_SET)) - 1);
+
+  for (int i = 0; i < BTB_PREFETCH_BUFFER_WAY; ++i) {
+    if (entry[set][i].valid && entry[set][i].ip == trigger) {
+      ooo_cpu[cpu].BTB.fill_btb(entry[set][i].ip, entry[set][i].data,
+                                branch_type, IS_BTB_BOTH);
+
+      entry[set][i].valid = 0;
+
+      uint32_t btb_set = ooo_cpu[cpu].BTB.get_set(trigger, IS_L2BTB);
+      uint32_t btb_way = ooo_cpu[cpu].BTB.get_way(trigger, btb_set, IS_L2BTB);
+
+      assert(btb_way != ooo_cpu[cpu].BTB.L2BTB.NUM_WAY);
+      return btb_way;
+    }
+  }
+
+  return ooo_cpu[cpu].BTB.L2BTB.NUM_WAY;
+}
+
+void BTB_PREFETCH_BUFFER::add_pfb(uint32_t cpu, uint64_t trigger,
+                                  uint64_t target) {
+  // first check if it exists in BTB already
+  uint32_t btb_set = ooo_cpu[cpu].BTB.get_set(trigger, IS_L2BTB);
+  uint32_t btb_way = ooo_cpu[cpu].BTB.get_way(trigger, btb_set, IS_L2BTB);
+
+  if (btb_way != ooo_cpu[cpu].BTB.L2BTB.NUM_WAY)
+    return;
+
+  // check if already present in BTB_PREFETCH_BUFFER
+  btb_set = (trigger >> 2) & ((1 << lg2(BTB_PREFETCH_BUFFER_SET)) - 1);
+  for (int i = 0; i < BTB_PREFETCH_BUFFER_WAY; ++i) {
+    if (entry[btb_set][i].ip == trigger)
+      btb_way = i;
+  }
+
+  if (btb_way < BTB_PREFETCH_BUFFER_WAY) {
+    // Update LRU.
+    int lru = entry[btb_set][btb_way].lru;
+    for (int i = 0; i < BTB_PREFETCH_BUFFER_WAY; ++i)
+      if (entry[btb_set][i].lru < lru)
+        entry[btb_set][i].lru++;
+
+    entry[btb_set][btb_way].lru = 0;
+  } else {
+    // add to BTB_PREFETCH_BUFFER
+    // find invalid entry first.
+    for (btb_way = 0; btb_way < BTB_PREFETCH_BUFFER_WAY; ++btb_way)
+      if (entry[btb_set][btb_way].valid == 0)
+        break;
+
+    if (btb_way >= BTB_PREFETCH_BUFFER_WAY)
+      for (btb_way = 0; btb_way < BTB_PREFETCH_BUFFER_WAY; ++btb_way)
+        if (entry[btb_set][btb_way].lru == BTB_PREFETCH_BUFFER_WAY - 1)
+          break;
+
+    assert(btb_way < BTB_PREFETCH_BUFFER_WAY);
+
+    // Update LRU.
+    int lru = entry[btb_set][btb_way].lru;
+    for (int i = 0; i < BTB_PREFETCH_BUFFER_WAY; ++i)
+      if (entry[btb_set][i].lru < lru)
+        entry[btb_set][i].lru++;
+
+    entry[btb_set][btb_way].lru = 0;
+
+    entry[btb_set][btb_way].valid = 1;
+    entry[btb_set][btb_way].dirty = 0;
+    entry[btb_set][btb_way].tag = trigger;
+    entry[btb_set][btb_way].address = trigger;
+    entry[btb_set][btb_way].full_addr = trigger;
+    entry[btb_set][btb_way].data = target;
+    entry[btb_set][btb_way].ip = trigger;
+    entry[btb_set][btb_way].cpu = cpu;
+  }
+}
+
+int useful_prefetches, useless_prefetches, misses_tracked, misses_ommitted;
+uint64_t debugvar, rluyes, rlutotal;
+uint32_t branches_caught, accurate_branches_caught, miss_branches;
+
+uint32_t DNC::get_SeqTable_set(uint64_t ip) {
+  return (uint32_t)((ip >> LOG2_BLOCK_SIZE) & (SEQTABLE_SIZE - 1));
+}
+
+uint32_t DNC::get_DisTable_set(uint64_t ip) {
+  return (uint32_t)((ip >> LOG2_BLOCK_SIZE) & (DISTABLE_SIZE - 1));
+}
+
+uint32_t DNC::get_DisTable_partial_tag(uint64_t ip) {
+  return (uint32_t)((ip >> (LOG2_BLOCK_SIZE + lg2(DISTABLE_SIZE))) &
+                    ((1 << DIS_PART_TAG) - 1));
+}
+
+int DNC::add_rluq(uint64_t v_addr, uint8_t prefetch) {
+  ++rlutotal;
+
+  int rlu_way;
+
+  // check if RLUQ already has that entry, if yes update lru
+  for (rlu_way = 0; rlu_way < RLUQ_LEN; ++rlu_way)
+    if (RLUQ[rlu_way].valid && RLUQ[rlu_way].ip == v_addr)
+      break;
+
+  if (rlu_way < RLUQ_LEN) {
+    // RLUQ already has that entry. update lru and return
+    for (int i = 0; i < RLUQ_LEN; ++i)
+      if (RLUQ[i].lru < RLUQ[rlu_way].lru)
+        RLUQ[i].lru++;
+
+    RLUQ[rlu_way].lru = 0;
+
+    return 0;
+  } else {
+    ++rluyes;
+    // RLUQ does not already have the entry. add an RLU entry
+    // find an invalid entry to evict
+    for (rlu_way = 0; rlu_way < RLUQ_LEN; ++rlu_way)
+      if (!RLUQ[rlu_way].valid)
+        break;
+
+    // if no invalid find the one with max lru
+    if (rlu_way == RLUQ_LEN)
+      for (rlu_way = 0; rlu_way < RLUQ_LEN; ++rlu_way)
+        if (RLUQ[rlu_way].lru == RLUQ_LEN - 1)
+          break;
+
+    assert(rlu_way < RLUQ_LEN);
+
+    // update lru
+    for (int i = 0; i < RLUQ_LEN; ++i)
+      if (RLUQ[i].lru < RLUQ[rlu_way].lru)
+        RLUQ[i].lru++;
+
+    RLUQ[rlu_way].lru = 0;
+
+    RLUQ[rlu_way].valid = true;
+    RLUQ[rlu_way].ip = v_addr;
+    RLUQ[rlu_way].prefetched = prefetch;
+
+    return 1;
+  }
+}
+
+uint64_t to_predecode = 0, predecoding_something = 0;
+
+void DNC::operate_predecode(uint32_t cpu) {
+  /*
+  From Predecode Buffer pop the head entry. Predecode the block it is in.
+  If we find the branch, see if target is available, add to btb and prefetch.
+  If target isn't availabe, check BTB, and if hit in BTB, prefetch.
+  If we find other branches in the block, send them to the BTB Prefetch Buffer.
+  */
+  for (int i = 0; i < PREDECODES_PER_CYCLE; ++i) {
+    if (predecode_buffer.occupancy == 0)
+      break;
+
+    uint32_t set = predecode_buffer.entry[predecode_buffer.head].set;
+    uint64_t branch_ip =
+        predecode_buffer.entry[predecode_buffer.head].branch_ip;
+    uint32_t depth = predecode_buffer.entry[predecode_buffer.head].depth;
+    uint64_t blk = branch_ip >> LOG2_BLOCK_SIZE;
+
+    to_predecode++;
+
+    bool predecoded = false;
+    // predecode block and add to BTB or DISQ.
+    for (int i = 0; i < branches[set].size(); ++i) {
+      Conds ins = branches[set][i];
+
+      if (ins.ip == branch_ip) {
+        if (ins.branch_type == NOT_BRANCH)
+          continue;
+
+        if (ins.branch_type == BRANCH_DIRECT_JUMP ||
+            ins.branch_type == BRANCH_DIRECT_CALL ||
+            ins.branch_type == BRANCH_CONDITIONAL) {
+          // we've decoded the target.
+          // send prefetch request and add to BTB.
+          ooo_cpu[cpu].BTB.fill_btb(branch_ip, ins.branch_target,
+                                    ins.branch_type, IS_L2BTB);
+          add_disq(ins.branch_target, depth);
+          predecoded = true;
+        } else if (ins.branch_type == BRANCH_INDIRECT ||
+                   ins.branch_type == BRANCH_INDIRECT_CALL ||
+                   ins.branch_type == BRANCH_RETURN) {
+          // we've no idea what the target is.
+          // check btb to see if target exists
+          // if found in BTB, send prefetch to target block.
+          uint32_t btb_set = ooo_cpu[cpu].BTB.get_set(branch_ip, IS_L2BTB);
+          uint32_t btb_way =
+              ooo_cpu[cpu].BTB.get_way(branch_ip, btb_set, IS_L2BTB);
+
+          if (btb_way != ooo_cpu[cpu].BTB.L2BTB.NUM_WAY) {
+            add_disq(ooo_cpu[cpu].BTB.L2BTB.block[btb_set][btb_way].data,
+                     depth);
+          }
+        }
+
+      } else if ((ins.ip >> LOG2_BLOCK_SIZE) == blk) {
+
+        if (ins.branch_type == NOT_BRANCH)
+          continue;
+
+        if (ins.branch_type == BRANCH_DIRECT_JUMP ||
+            ins.branch_type == BRANCH_DIRECT_CALL ||
+            ins.branch_type == BRANCH_CONDITIONAL) {
+          // we've decoded the target.
+          // add to BTB PREF_BUF.
+          ooo_cpu[cpu].btb_prefetch_buffer.add_pfb(cpu, branch_ip,
+                                                   ins.branch_target);
+          predecoded = true;
+        } else if (ins.branch_type == BRANCH_INDIRECT ||
+                   ins.branch_type == BRANCH_INDIRECT_CALL ||
+                   ins.branch_type == BRANCH_RETURN) {
+          // do nothing
+        }
+      }
+
+      if (predecoded)
+        predecoding_something++;
+    }
+
+    predecode_buffer.head = (predecode_buffer.head + 1) % PREDECODE_BUFFER_LEN;
+    predecode_buffer.occupancy--;
+  }
+}
+
+int DNC::predecode(uint64_t branch_ip, uint32_t set, uint32_t depth) {
+
+  if (predecode_buffer.occupancy == PREDECODE_BUFFER_LEN)
+    return -1;
+
+  predecode_buffer.entry[predecode_buffer.tail].branch_ip = branch_ip;
+  predecode_buffer.entry[predecode_buffer.tail].set = set;
+  predecode_buffer.entry[predecode_buffer.tail].depth = depth;
+
+  predecode_buffer.tail = (predecode_buffer.tail + 1) % PREDECODE_BUFFER_LEN;
+  predecode_buffer.occupancy++;
+
+  return 0;
+}
+
+void DNC::add_seqq(uint64_t prefetch_target, uint32_t depth) {
+  if (depth == TERMINATING_DEPTH)
+    return;
+
+  if (SeqQ.occupancy == PREFETCH_QUEUE_LEN)
+    return;
+
+  // add to SeqQ
+  SeqQ.entry[SeqQ.tail].ip = prefetch_target;
+  SeqQ.entry[SeqQ.tail].depth = depth;
+
+  SeqQ.occupancy++;
+  SeqQ.tail = (SeqQ.tail + 1) % PREFETCH_QUEUE_LEN;
+}
+
+void DNC::add_disq(uint64_t prefetch_target, uint32_t depth) {
+  if (depth == TERMINATING_DEPTH)
+    return;
+
+  if (DisQ.occupancy == PREFETCH_QUEUE_LEN)
+    return;
+
+  // add to DisQ
+  DisQ.entry[DisQ.tail].ip = prefetch_target;
+  DisQ.entry[DisQ.tail].depth = depth;
+
+  DisQ.occupancy++;
+  DisQ.tail = (DisQ.tail + 1) % PREFETCH_QUEUE_LEN;
+
+  // SN1L Prefetching
+  add_seqq((prefetch_target + (1 << LOG2_BLOCK_SIZE)), depth + 1);
+}
+
+void O3_CPU::l1i_prefetcher_initialize() {
+  cout << "SN4L + DIS + BTB Prefetcher for L1I CPU " << cpu << endl;
+  cout << btb_prefetch_buffer.condfile << endl;
+
+  useless_prefetches = 0;
+  useful_prefetches = 0;
+  misses_tracked = 0;
+  misses_ommitted = 0;
+
+  // read branches for predecoder use
+  std::string file_to_read = "./conditional/" + btb_prefetch_buffer.condfile;
+  const char *cstr = file_to_read.c_str();
+  int fp = open(cstr, O_RDWR);
+
+  if (!fp) {
+    fprintf(stderr, "error: open %s :: %s\n\n", cstr, strerror(errno));
+    assert(0);
+  }
+
+  Conds e;
+  uint32_t set;
+  int rw = 0;
+  while ((rw = read(fp, &e, sizeof(e)))) {
+    assert(rw == sizeof(e));
+    set = ((e.ip) >> LOG2_BLOCK_SIZE) & ((1 << lg2(L1I_SET)) - 1);
+
+    L1IPrefetcher.branches[set].push_back(e);
+  }
+  close(fp);
+
+  // set all bits in SeqTable initially
+  for (int i = 0; i < SEQTABLE_SIZE; ++i)
+    L1IPrefetcher.SeqTable[i] = true;
+
+  // initialize all entries in DisTable
+  for (int i = 0; i < DISTABLE_SIZE; ++i) {
+    L1IPrefetcher.DisTable[i].valid = false;
+    L1IPrefetcher.DisTable[i].partial_tag = 0;
+    L1IPrefetcher.DisTable[i].offset = 0;
+  }
+
+  // initialize the RECENTLY LOOKED UP QUEUE
+  for (int i = 0; i < RLUQ_LEN; ++i) {
+    L1IPrefetcher.RLUQ[i].valid = false;
+    L1IPrefetcher.RLUQ[i].lru = i;
+  }
+
+  // initialize the predecode buffer
+  L1IPrefetcher.predecode_buffer.head = 0;
+  L1IPrefetcher.predecode_buffer.tail = 0;
+  L1IPrefetcher.predecode_buffer.occupancy = 0;
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type,
+                                           uint64_t branch_target) {}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit,
+                                          uint8_t prefetch_hit) {
+
+  // block has been looked up by processor, so add to RLUQ
+  L1IPrefetcher.add_rluq(v_addr, 0);
+
+  uint32_t set = L1I.get_set(L1I.RQ.entry[L1I.RQ.head].address);
+  uint32_t way = L1I.get_way(L1I.RQ.entry[L1I.RQ.head].address, set);
+  uint64_t blk_addr;
+
+  // if hit in cache
+  if (cache_hit) {
+    // set SeqTable bit as this block is used
+    uint32_t seqset = L1IPrefetcher.get_SeqTable_set(v_addr);
+    L1IPrefetcher.SeqTable[seqset] = true;
+
+    if (prefetch_hit)
+      ++useful_prefetches;
+
+    // run SN4L Prefetcher.
+    uint8_t sn4lvector = L1I.block[set][way].snxlvector;
+
+    for (uint8_t i = 0; i < 4; ++i)
+      if (sn4lvector & (1 << i)) {
+        blk_addr = (v_addr >> LOG2_BLOCK_SIZE) + (i + 1);
+        L1IPrefetcher.add_seqq(blk_addr << LOG2_BLOCK_SIZE, 0);
+      }
+
+    // run DIS Prefetcher
+    uint32_t disset = L1IPrefetcher.get_DisTable_set(v_addr);
+
+    if (L1IPrefetcher.DisTable[disset].valid) {
+      uint32_t ptag = L1IPrefetcher.get_DisTable_partial_tag(v_addr);
+
+      if (L1IPrefetcher.DisTable[disset].partial_tag == ptag) {
+        uint64_t branch_ip = ((v_addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE) +
+                             (4 * L1IPrefetcher.DisTable[disset].offset);
+
+        L1IPrefetcher.predecode(branch_ip, set, 0);
+      }
+    }
+
+  } else {
+    // see if this missed block was the target of some pending branch
+    blk_addr = v_addr >> LOG2_BLOCK_SIZE;
+
+    // search if a branch in pending_branch_queue has target in same blk
+    uint64_t x;
+    int i, a, btn, j;
+
+    btn = 0;
+    auto ftq_it = FTQ.entry.begin();
+    for (; ftq_it != FTQ.entry.end(); ftq_it++) {
+      if (ftq_it->size() > 0 &&
+          blk_addr == ftq_it->at(0).ip >> LOG2_BLOCK_SIZE) {
+        if (ftq_it != FTQ.entry.begin()) {
+          ftq_it--;
+          if (ftq_it->size() > 0 && ftq_it->at(ftq_it->size() - 1).is_branch) {
+            ++branches_caught;
+            if (ftq_it->at(ftq_it->size() - 1).branch_target >>
+                    LOG2_BLOCK_SIZE ==
+                blk_addr) {
+              btn = 1;
+              ++accurate_branches_caught;
+            }
+          }
+          ftq_it++;
+          ++miss_branches;
+        } else {
+          if (DECODE_BUFFER.occupancy > 0) {
+            i = DECODE_BUFFER.tail;
+            if (DECODE_BUFFER.entry[i].is_branch) {
+              ++branches_caught;
+              if (DECODE_BUFFER.entry[i].branch_target >> LOG2_BLOCK_SIZE ==
+                  blk_addr) {
+                btn = 2;
+                ++accurate_branches_caught;
+              }
+            }
+            ++miss_branches;
+          } else if (ROB.occupancy > 0) {
+            i = ROB.tail;
+            if (ROB.entry[i].is_branch) {
+              ++branches_caught;
+              if (ROB.entry[i].branch_target >> LOG2_BLOCK_SIZE == blk_addr) {
+                btn = 3;
+                ++accurate_branches_caught;
+              }
+            }
+            ++miss_branches;
+          }
+        }
+
+        break; // change pos of this break and see
+      }
+    }
+
+    if (btn && ftq_it != FTQ.entry.end()) {
+      // found one. Now record into DisTable.
+      misses_tracked++;
+
+      if (btn == 1)
+        x = ftq_it->at(ftq_it->size() - 1).ip;
+      else if (btn == 2)
+        x = DECODE_BUFFER.entry[i].ip;
+      else if (btn == 3)
+        x = ROB.entry[i].ip;
+      else
+        assert(0);
+
+      uint32_t disset = L1IPrefetcher.get_DisTable_set(x);
+      uint32_t ptag = L1IPrefetcher.get_DisTable_partial_tag(x);
+      uint32_t offset = (x % 64) / 4;
+
+      L1IPrefetcher.DisTable[disset].valid = true;
+      L1IPrefetcher.DisTable[disset].partial_tag = ptag;
+      L1IPrefetcher.DisTable[disset].offset = offset;
+
+    } else {
+      misses_ommitted++;
+    }
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cycle_operate() {
+  // add block to RLUQ before prefetching
+  bool keep_prefetching = true;
+
+  while (keep_prefetching) {
+    if (L1I.PQ.occupancy >= L1I.PQ.SIZE || (L1IPrefetcher.DisQ.occupancy == 0 &&
+                                            L1IPrefetcher.SeqQ.occupancy == 0))
+      keep_prefetching = false;
+    else {
+
+      if (L1IPrefetcher.DisQ.occupancy > 0 &&
+          (L1IPrefetcher.SeqQ.occupancy == 0 ||
+           L1IPrefetcher.DisQ.entry[L1IPrefetcher.DisQ.head].depth <=
+               L1IPrefetcher.SeqQ.entry[L1IPrefetcher.SeqQ.head].depth)) {
+
+        if (L1IPrefetcher.add_rluq(
+                L1IPrefetcher.DisQ.entry[L1IPrefetcher.DisQ.head].ip, 1)) {
+          prefetch_code_line(
+              L1IPrefetcher.DisQ.entry[L1IPrefetcher.DisQ.head].ip);
+
+          if (L1IPrefetcher.issued.occupancy < ISSUED_PREFETCH_QUEUE_LEN) {
+            L1IPrefetcher.issued.entry[L1IPrefetcher.issued.tail].ip =
+                L1IPrefetcher.DisQ.entry[L1IPrefetcher.DisQ.head].ip;
+            L1IPrefetcher.issued.entry[L1IPrefetcher.issued.tail].depth =
+                L1IPrefetcher.DisQ.entry[L1IPrefetcher.DisQ.head].depth;
+            L1IPrefetcher.issued.entry[L1IPrefetcher.issued.tail].prefetched =
+                0;
+
+            L1IPrefetcher.issued.tail =
+                ((L1IPrefetcher.issued.tail + 1) % ISSUED_PREFETCH_QUEUE_LEN);
+
+            L1IPrefetcher.issued.occupancy++;
+            // printf("%x\n",
+            // L1IPrefetcher.DisQ.entry[L1IPrefetcher.DisQ.head].ip);
+          }
+        }
+
+        L1IPrefetcher.DisQ.head =
+            (L1IPrefetcher.DisQ.head + 1) % PREFETCH_QUEUE_LEN;
+        L1IPrefetcher.DisQ.occupancy--;
+      } else if (L1IPrefetcher.SeqQ.occupancy > 0) {
+        ++debugvar;
+
+        if (L1IPrefetcher.add_rluq(
+                L1IPrefetcher.SeqQ.entry[L1IPrefetcher.SeqQ.head].ip, 1)) {
+          prefetch_code_line(
+              L1IPrefetcher.SeqQ.entry[L1IPrefetcher.SeqQ.head].ip);
+
+          if (L1IPrefetcher.issued.occupancy < ISSUED_PREFETCH_QUEUE_LEN) {
+            L1IPrefetcher.issued.entry[L1IPrefetcher.issued.tail].ip =
+                L1IPrefetcher.SeqQ.entry[L1IPrefetcher.SeqQ.head].ip;
+            L1IPrefetcher.issued.entry[L1IPrefetcher.issued.tail].depth =
+                L1IPrefetcher.SeqQ.entry[L1IPrefetcher.SeqQ.head].depth;
+            L1IPrefetcher.issued.entry[L1IPrefetcher.issued.tail].prefetched =
+                0;
+
+            L1IPrefetcher.issued.tail =
+                ((L1IPrefetcher.issued.tail + 1) % ISSUED_PREFETCH_QUEUE_LEN);
+
+            L1IPrefetcher.issued.occupancy++;
+          }
+        }
+
+        L1IPrefetcher.SeqQ.head =
+            (L1IPrefetcher.SeqQ.head + 1) % PREFETCH_QUEUE_LEN;
+        L1IPrefetcher.SeqQ.occupancy--;
+      }
+    }
+  }
+
+  // clean up issued_prefetches queue.
+
+  while (L1IPrefetcher.issued.occupancy > 0 ||
+         L1IPrefetcher.issued.entry[L1IPrefetcher.issued.head].prefetched) {
+    L1IPrefetcher.issued.occupancy--;
+    L1IPrefetcher.issued.head =
+        ((L1IPrefetcher.issued.head + 1) % ISSUED_PREFETCH_QUEUE_LEN);
+  }
+
+  // operate_predecode
+  L1IPrefetcher.operate_predecode(cpu);
+}
+
+void CACHE::l1i_prefetcher_prefetch_hit(uint8_t cpu, uint64_t v_addr,
+                                        uint64_t blk_addr) {
+  ooo_cpu[cpu].l1i_prefetcher_prefetch_hit(v_addr, blk_addr);
+}
+
+void O3_CPU::l1i_prefetcher_prefetch_hit(uint64_t v_addr, uint64_t blk_addr) {
+  /*
+  check if the block we're trying to prefetch has depth contains branches.
+  Predecode the block if yes.
+  */
+
+  uint32_t set = L1I.get_set(blk_addr);
+  uint32_t way = L1I.get_way(blk_addr, set);
+
+  uint32_t disset = L1IPrefetcher.get_DisTable_set(v_addr);
+
+  if (L1IPrefetcher.DisTable[disset].valid) {
+    uint32_t ptag = L1IPrefetcher.get_DisTable_partial_tag(v_addr);
+
+    uint32_t index = L1IPrefetcher.issued.head;
+    uint32_t i = 0;
+
+    for (i = 0; i < L1IPrefetcher.issued.occupancy; ++i) {
+      if (L1IPrefetcher.issued.entry[index].ip == v_addr &&
+          !L1IPrefetcher.issued.entry[index].prefetched)
+        break;
+
+      index = (index + 1) % ISSUED_PREFETCH_QUEUE_LEN;
+    }
+    if (i == L1IPrefetcher.issued.occupancy)
+      return;
+
+    L1IPrefetcher.issued.entry[index].prefetched = true;
+
+    if (L1IPrefetcher.DisTable[disset].partial_tag == ptag) {
+      uint64_t branch_ip = ((v_addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE) +
+                           (4 * L1IPrefetcher.DisTable[disset].offset);
+
+      L1IPrefetcher.predecode(branch_ip, set,
+                              L1IPrefetcher.issued.entry[index].depth + 1);
+    }
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_v_addr) {
+  // This is called just before fill_cache
+
+  // SN4L Prefetcher Activity
+  uint32_t seqset, disset;
+
+  if (L1I.block[set][way].prefetch && L1I.block[set][way].used == 0) {
+    // useless Prefetch;
+    seqset = L1IPrefetcher.get_SeqTable_set(evicted_v_addr);
+    L1IPrefetcher.SeqTable[seqset] = false;
+  }
+
+  if (L1I.block[set][way].prefetch && !L1I.block[set][way].used)
+    ++useless_prefetches;
+
+  // assign new value to the block's sn4l bitset.
+  uint8_t sn4lvector = 0;
+  uint64_t blk_ip;
+  for (int i = 0; i < 4; ++i) {
+    blk_ip = ((v_addr >> LOG2_BLOCK_SIZE) + (i + 1)) << LOG2_BLOCK_SIZE;
+
+    seqset = L1IPrefetcher.get_SeqTable_set(blk_ip);
+
+    if (L1IPrefetcher.SeqTable[seqset])
+      sn4lvector += (1 << i);
+  }
+
+  L1I.block[set][way].snxlvector = sn4lvector;
+
+  // send prefetch request.
+  for (uint8_t i = 0; i < 4; ++i)
+    if (sn4lvector & (1 << i)) {
+      blk_ip = ((v_addr >> LOG2_BLOCK_SIZE) + (i + 1)) << LOG2_BLOCK_SIZE;
+      L1IPrefetcher.add_seqq(blk_ip, 0);
+    }
+
+  // DIS Prefetcher Activity
+  /*
+  when a block demanded by fetch misses in cache, we initiate predecode
+  when it is filled into cache
+  check if for some offset has been noted for this block in DisTable
+  if yes, find branch_ip and decode block.
+  */
+  disset = L1IPrefetcher.get_DisTable_set(v_addr);
+
+  if (L1IPrefetcher.DisTable[disset].valid) // && !prefetch) <== TODO:CHECK this
+  {
+    uint32_t ptag = L1IPrefetcher.DisTable[disset].partial_tag;
+    uint8_t offset = L1IPrefetcher.DisTable[disset].offset;
+
+    if (L1IPrefetcher.get_DisTable_partial_tag(v_addr) == ptag) {
+      uint64_t branch_ip = (v_addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE;
+      branch_ip += 4 * offset;
+
+      L1IPrefetcher.predecode(branch_ip, set, 0);
+    }
+  }
+}
+
+void O3_CPU::l1i_prefetcher_final_stats() {
+  cout << "CPU " << cpu << " L1I prefetcher final stats" << endl;
+  cout << "USEFUL PREFETCHES " << useful_prefetches << endl;
+  cout << "USELESS PREFETCHES " << useless_prefetches << endl;
+  cout << "MISSES TRACKED " << misses_tracked << endl;
+  cout << "MISSES OMITTED " << misses_ommitted << endl;
+  cout << accurate_branches_caught << " " << branches_caught << " "
+       << miss_branches << "BRANCHES PENDING\n";
+  cout << rluyes << "/" << rlutotal << endl;
+
+  cout << "To predecode: " << to_predecode
+       << " predecoding_something: " << predecoding_something << endl;
+}

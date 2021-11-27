@@ -1,0 +1,479 @@
+#include "ooo_cpu.h"
+
+#define IPREF_RAS_SIZE                                                         \
+  1024 // Avoid overflow with a large RAS (not counted in overhead)
+#define IPREF_LOOKAHEAD 4 // Prefetch lookahead
+#define IPREF_SIGNATURE_HASH_DEPTH                                             \
+  4 // How many RAS top entries used to build a signature
+#define IPREF_NUM_REGIONS_PER_ENTRY                                            \
+  2 // Number of regions tracked per table entry
+
+// Region table configuration
+#define LOG_NUM_IPREF_REGION_TABLE_SETS 10
+#define NUM_IPREF_REGION_TABLE_SETS (1 << LOG_NUM_IPREF_REGION_TABLE_SETS)
+#define NUM_IPREF_REGION_TABLE_WAYS 14
+
+// Partial tag length per region table entry
+#define IPREF_TAG_BITS 12
+#define IPREF_TAG_MASK ((1 << IPREF_TAG_BITS) - 1)
+
+// Lower target length
+#define IPREF_TARGET_BITS 14
+#define IPREF_TARGET_MASK ((1 << IPREF_TARGET_BITS) - 1)
+
+// Upper target pointer size
+#define IPREF_UPPER_TARGET_POINTER_BITS 5
+
+// Number of dictionary entries
+#define IPREF_UPPER_TARGET_DICTIONARY_SIZE                                     \
+  (1 << IPREF_UPPER_TARGET_POINTER_BITS)
+
+// How big a region is (in terms of number of contiguous cache blocks)
+#define IPREF_LOG_REGION_SIZE 3
+#define IPREF_REGION_SIZE (1 << IPREF_LOG_REGION_SIZE)
+#define IPREF_REGION_MASK (IPREF_REGION_SIZE - 1)
+
+uint64_t iprefRAS[IPREF_RAS_SIZE]; // Simulated return address stack
+uint32_t iprefRAStop;              // RAS top pointer
+uint32_t iprefRASoverflowcount;    // Number of overflows in RAS
+
+uint64_t iprefCurrentSig;                            // Current signature
+uint64_t iprefSignatureHistory[IPREF_LOOKAHEAD + 1]; // History of signatures
+uint8_t iprefSignatureHistoryWP; // Write pointer for signature history
+
+// Region table entry; size = 69 bits
+class IPREF_RegionTableEntry {
+public:
+  uint64_t tag;                                              // 12 bits
+  uint32_t lower_target[IPREF_NUM_REGIONS_PER_ENTRY];        // 28 bits
+  uint8_t upper_target_pointer[IPREF_NUM_REGIONS_PER_ENTRY]; // 10 bits
+  uint8_t vector[IPREF_NUM_REGIONS_PER_ENTRY];               // 16 bits
+  uint8_t rrpv;                                              //  2 bits
+  bool valid;                                                //  1 bit
+};
+
+IPREF_RegionTableEntry
+    iprefRegionTable[NUM_IPREF_REGION_TABLE_SETS]
+                    [NUM_IPREF_REGION_TABLE_WAYS]; // 1024x14x69 bits = 120.75
+                                                   // KB
+IPREF_RegionTableEntry predEntry, updateEntry;     // Staging entries
+
+// Dictionary entry; size = 50 bits
+class IPREF_DictionaryEntry {
+public:
+  uint64_t upper_target; // 44 bits
+  uint64_t lru;          //  5 bits
+  bool valid;            //  1 bit
+};
+
+IPREF_DictionaryEntry
+    iprefDictionary[IPREF_UPPER_TARGET_DICTIONARY_SIZE]; // 32x50 bits = 1600
+                                                         // bits
+
+// Allocate a target in the dictionary if not already present
+static uint32_t iprefDictionaryAllocate(uint64_t upper_target) {
+  uint8_t i;
+
+  for (i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++) {
+    if (iprefDictionary[i].valid &&
+        (iprefDictionary[i].upper_target == upper_target)) {
+      // Hit
+      break;
+    }
+  }
+
+  if (i == IPREF_UPPER_TARGET_DICTIONARY_SIZE) {
+    // Miss: replace, allocate
+    for (i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++) {
+      if (!iprefDictionary[i].valid)
+        break;
+    }
+    if (i == IPREF_UPPER_TARGET_DICTIONARY_SIZE) {
+      uint64_t maxlru = 0;
+      int index = -1;
+      for (i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++) {
+        if (iprefDictionary[i].lru > maxlru) {
+          maxlru = iprefDictionary[i].lru;
+          index = i;
+        }
+      }
+      i = index;
+    }
+    iprefDictionary[i].upper_target = upper_target;
+    iprefDictionary[i].valid = true;
+  }
+
+  for (uint8_t j = 0; j < IPREF_UPPER_TARGET_DICTIONARY_SIZE; j++)
+    iprefDictionary[j].lru++;
+  iprefDictionary[i].lru = 0;
+
+  return i;
+}
+
+// Update LRU states in dictionary on a read
+static void iprefDictionaryUpdateLRUState(uint8_t read_index) {
+  for (uint8_t j = 0; j < IPREF_UPPER_TARGET_DICTIONARY_SIZE; j++)
+    iprefDictionary[j].lru++;
+  iprefDictionary[read_index].lru = 0;
+}
+
+// Look up region table to retrieve prefetch candidates
+static bool iprefRegionTableLookup(uint64_t signature) {
+  uint32_t iprefRegionTableIndex =
+      (signature & (NUM_IPREF_REGION_TABLE_SETS - 1));
+  uint64_t iprefRegionTableTag =
+      (signature >> LOG_NUM_IPREF_REGION_TABLE_SETS) & IPREF_TAG_MASK;
+  uint32_t i;
+
+  for (i = 0; i < NUM_IPREF_REGION_TABLE_WAYS; i++) {
+    if (iprefRegionTable[iprefRegionTableIndex][i].valid &&
+        (iprefRegionTable[iprefRegionTableIndex][i].tag ==
+         iprefRegionTableTag)) {
+      // Hit
+      // Populate the staging entry with prefetching information
+      for (uint8_t k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+        predEntry.lower_target[k] =
+            iprefRegionTable[iprefRegionTableIndex][i].lower_target[k];
+        predEntry.upper_target_pointer[k] =
+            iprefRegionTable[iprefRegionTableIndex][i].upper_target_pointer[k];
+        predEntry.vector[k] =
+            iprefRegionTable[iprefRegionTableIndex][i].vector[k];
+        if (predEntry.vector[k]) { // Non-empty region
+          iprefDictionaryUpdateLRUState(predEntry.upper_target_pointer[k]);
+        }
+      }
+      iprefRegionTable[iprefRegionTableIndex][i].rrpv = 0;
+      return true;
+    }
+  }
+
+  // Miss
+  return false;
+}
+
+// Allocate a new entry
+static void iprefRegionTableAllocate(uint64_t signature) {
+  uint32_t iprefRegionTableIndex =
+      (signature & (NUM_IPREF_REGION_TABLE_SETS - 1));
+  uint64_t iprefRegionTableTag =
+      (signature >> LOG_NUM_IPREF_REGION_TABLE_SETS) & IPREF_TAG_MASK;
+  uint32_t i;
+
+  for (i = 0; i < NUM_IPREF_REGION_TABLE_WAYS; i++) {
+    if (iprefRegionTable[iprefRegionTableIndex][i].valid &&
+        (iprefRegionTable[iprefRegionTableIndex][i].tag ==
+         iprefRegionTableTag)) {
+      // Hit
+      for (uint8_t k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+        iprefRegionTable[iprefRegionTableIndex][i].lower_target[k] =
+            updateEntry.lower_target[k];
+        iprefRegionTable[iprefRegionTableIndex][i].upper_target_pointer[k] =
+            updateEntry.upper_target_pointer[k];
+        iprefRegionTable[iprefRegionTableIndex][i].vector[k] =
+            updateEntry.vector[k];
+      }
+      iprefRegionTable[iprefRegionTableIndex][i].rrpv = 0;
+      break;
+    }
+  }
+
+  if (i == NUM_IPREF_REGION_TABLE_WAYS) {
+    // Miss: replace, allocate
+    for (i = 0; i < NUM_IPREF_REGION_TABLE_WAYS; i++) {
+      if (!iprefRegionTable[iprefRegionTableIndex][i].valid)
+        break;
+    }
+    if (i == NUM_IPREF_REGION_TABLE_WAYS) {
+      while (1) {
+        for (i = 0; i < NUM_IPREF_REGION_TABLE_WAYS; i++) {
+          if (iprefRegionTable[iprefRegionTableIndex][i].rrpv == 3)
+            break;
+        }
+        if (i == NUM_IPREF_REGION_TABLE_WAYS) {
+          for (i = 0; i < NUM_IPREF_REGION_TABLE_WAYS; i++)
+            iprefRegionTable[iprefRegionTableIndex][i].rrpv++;
+        } else
+          break;
+      }
+    }
+    assert(i < NUM_IPREF_REGION_TABLE_WAYS);
+    iprefRegionTable[iprefRegionTableIndex][i].tag = iprefRegionTableTag;
+    for (uint8_t k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+      iprefRegionTable[iprefRegionTableIndex][i].lower_target[k] =
+          updateEntry.lower_target[k];
+      iprefRegionTable[iprefRegionTableIndex][i].upper_target_pointer[k] =
+          updateEntry.upper_target_pointer[k];
+      iprefRegionTable[iprefRegionTableIndex][i].vector[k] =
+          updateEntry.vector[k];
+    }
+    iprefRegionTable[iprefRegionTableIndex][i].valid = true;
+    iprefRegionTable[iprefRegionTableIndex][i].rrpv = 2;
+  }
+}
+
+// Recent access filter entry; size = 59 bits
+class IPrefFilterEntry {
+public:
+  bool valid;   //  1 bit
+  uint64_t tag; // 58 bits
+};
+
+IPrefFilterEntry iprefFilter[IPREF_NUM_REGIONS_PER_ENTRY * IPREF_REGION_SIZE];
+uint8_t iprefFilterTailPtr;
+
+// Search for a block address in the filter
+static bool iprefFilterLookup(uint64_t block_addr) {
+  for (int i = 0; i < IPREF_NUM_REGIONS_PER_ENTRY * IPREF_REGION_SIZE; i++) {
+    if (iprefFilter[i].valid && (iprefFilter[i].tag == block_addr))
+      return true;
+  }
+  return false;
+}
+
+// Enqueue a new block address at the tail
+static void iprefFilterInsert(uint64_t block_addr) {
+  iprefFilter[iprefFilterTailPtr].tag = block_addr;
+  iprefFilter[iprefFilterTailPtr].valid = true;
+  iprefFilterTailPtr = (iprefFilterTailPtr + 1) %
+                       (IPREF_NUM_REGIONS_PER_ENTRY * IPREF_REGION_SIZE);
+}
+
+bool current_region_valid; // Set if a region being recorded currently
+
+void O3_CPU::l1i_prefetcher_initialize() {
+  iprefRAStop = 0;
+  iprefRASoverflowcount = 0;
+
+  iprefCurrentSig = 0;
+  iprefSignatureHistoryWP = 0;
+
+  for (int i = 0; i < IPREF_LOOKAHEAD + 1; i++) {
+    iprefSignatureHistory[i] = 0;
+  }
+
+  current_region_valid = false;
+
+  for (int i = 0; i < IPREF_NUM_REGIONS_PER_ENTRY * IPREF_REGION_SIZE; i++)
+    iprefFilter[i].valid = false;
+  iprefFilterTailPtr = 0;
+
+  for (int k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++)
+    updateEntry.vector[k] = 0;
+
+  for (int i = 0; i < NUM_IPREF_REGION_TABLE_SETS; i++)
+    for (int j = 0; j < NUM_IPREF_REGION_TABLE_WAYS; j++)
+      iprefRegionTable[i][j].valid = false;
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type,
+                                           uint64_t branch_target) {
+  uint64_t current_region;
+  uint8_t k;
+
+  // Update current region's vector or start a new region
+  if (current_region_valid) {
+    // Already a region being recorded
+    for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+      // Find a region that contains ip
+      if (updateEntry.vector[k] &&
+          ((ip >> (LOG2_BLOCK_SIZE + IPREF_LOG_REGION_SIZE)) ==
+           ((iprefDictionary[updateEntry.upper_target_pointer[k]].upper_target
+             << IPREF_TARGET_BITS) |
+            updateEntry.lower_target[k]))) {
+        // Hit
+        updateEntry.vector[k] =
+            updateEntry.vector[k] |
+            (1 << ((ip >> LOG2_BLOCK_SIZE) & IPREF_REGION_MASK));
+        break;
+      }
+    }
+    if (k == IPREF_NUM_REGIONS_PER_ENTRY) {
+      // Start a new region if there is an unoccupied vector
+      for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+        if (!updateEntry.vector[k])
+          break;
+      }
+      if (k < IPREF_NUM_REGIONS_PER_ENTRY) { // Found unoccupied vector
+        current_region = ip >> (LOG2_BLOCK_SIZE + IPREF_LOG_REGION_SIZE);
+        updateEntry.lower_target[k] = current_region & IPREF_TARGET_MASK;
+        updateEntry.upper_target_pointer[k] =
+            iprefDictionaryAllocate(current_region >> IPREF_TARGET_BITS);
+        updateEntry.vector[k] =
+            1 << ((ip >> LOG2_BLOCK_SIZE) & IPREF_REGION_MASK);
+      }
+    }
+  } else {
+    // Start recording regions
+    for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++)
+      updateEntry.vector[k] = 0;
+    current_region_valid = true;
+    current_region = ip >> (LOG2_BLOCK_SIZE + IPREF_LOG_REGION_SIZE);
+    updateEntry.lower_target[0] = current_region & IPREF_TARGET_MASK;
+    updateEntry.upper_target_pointer[0] =
+        iprefDictionaryAllocate(current_region >> IPREF_TARGET_BITS);
+    updateEntry.vector[0] = 1 << ((ip >> LOG2_BLOCK_SIZE) & IPREF_REGION_MASK);
+  }
+
+  // Detect change in signature
+  if ((branch_type == BRANCH_DIRECT_CALL) ||
+      (branch_type == BRANCH_INDIRECT_CALL)) {
+    // A new function call
+    // Allocate the recorded region in region table before starting a new record
+    for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+      if (updateEntry.vector[k])
+        break;
+    }
+    if (k < IPREF_NUM_REGIONS_PER_ENTRY) { // There is at least one region
+      iprefRegionTableAllocate(iprefSignatureHistory[iprefSignatureHistoryWP]);
+    }
+    // Update signature history
+    iprefSignatureHistory[iprefSignatureHistoryWP] = iprefCurrentSig;
+    iprefSignatureHistoryWP =
+        (iprefSignatureHistoryWP + 1) % (IPREF_LOOKAHEAD + 1);
+
+    // Update RAS
+    if (iprefRAStop == IPREF_RAS_SIZE)
+      iprefRASoverflowcount++;
+    else {
+      iprefRAS[iprefRAStop] = ip + 1; // This is not exactly correct
+      iprefRAStop++;
+    }
+
+    // Update signature
+    iprefCurrentSig = iprefRAS[iprefRAStop - 1];
+    for (uint32_t i = 0; i < IPREF_SIGNATURE_HASH_DEPTH - 1; i++) {
+      if (iprefRAStop >= i + 2) {
+        iprefCurrentSig = iprefCurrentSig ^ iprefRAS[iprefRAStop - i - 2];
+      } else
+        break;
+    }
+
+    // Inject prefetch with the new signature
+    if (iprefRegionTableLookup(iprefCurrentSig)) {
+      for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+        if (predEntry.vector[k]) {
+          uint64_t pf_region =
+              (iprefDictionary[predEntry.upper_target_pointer[k]].upper_target
+               << IPREF_TARGET_BITS) |
+              predEntry.lower_target[k];
+          uint8_t count = 0;
+          while (predEntry.vector[k]) {
+            if ((predEntry.vector[k] & 0x1) == 1) {
+              uint64_t pf_block = (pf_region << IPREF_LOG_REGION_SIZE) + count;
+              if (!iprefFilterLookup(pf_block)) {
+                prefetch_code_line(pf_block << LOG2_BLOCK_SIZE);
+                iprefFilterInsert(pf_block);
+              }
+            }
+            count++;
+            predEntry.vector[k] = predEntry.vector[k] >> 1;
+          }
+        }
+      }
+    }
+
+    // Prepare for new record
+    for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+      updateEntry.vector[k] = 0;
+    }
+    if (branch_target) {
+      // Start a region by following the branch target
+      current_region_valid = true;
+      current_region =
+          branch_target >> (LOG2_BLOCK_SIZE + IPREF_LOG_REGION_SIZE);
+      updateEntry.lower_target[0] = current_region & IPREF_TARGET_MASK;
+      updateEntry.upper_target_pointer[0] =
+          iprefDictionaryAllocate(current_region >> IPREF_TARGET_BITS);
+      updateEntry.vector[0] =
+          1 << ((branch_target >> LOG2_BLOCK_SIZE) & IPREF_REGION_MASK);
+    } else {
+      current_region_valid = false;
+    }
+  } else if (branch_type == BRANCH_RETURN) {
+    // A return: signature is about to change
+    // Update region table with the recorded regions
+    for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+      if (updateEntry.vector[k])
+        break;
+    }
+    if (k < IPREF_NUM_REGIONS_PER_ENTRY) { // At least one non-empty region
+      iprefRegionTableAllocate(iprefSignatureHistory[iprefSignatureHistoryWP]);
+    }
+    // Update signature histpry
+    iprefSignatureHistory[iprefSignatureHistoryWP] = iprefCurrentSig;
+    iprefSignatureHistoryWP =
+        (iprefSignatureHistoryWP + 1) % (IPREF_LOOKAHEAD + 1);
+
+    // Update RAS
+    if (iprefRASoverflowcount)
+      iprefRASoverflowcount--;
+    else if (iprefRAStop > 0) {
+      iprefRAStop--;
+    }
+
+    // Build new signature
+    iprefCurrentSig = iprefCurrentSig | 1;
+
+    // Inject prefetch with new signature
+    if (iprefRegionTableLookup(iprefCurrentSig)) {
+      for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+        if (predEntry.vector[k]) {
+          uint64_t pf_region =
+              (iprefDictionary[predEntry.upper_target_pointer[k]].upper_target
+               << IPREF_TARGET_BITS) |
+              predEntry.lower_target[k];
+          uint8_t count = 0;
+          while (predEntry.vector[k]) {
+            if ((predEntry.vector[k] & 0x1) == 1) {
+              uint64_t pf_block = (pf_region << IPREF_LOG_REGION_SIZE) + count;
+              if (!iprefFilterLookup(pf_block)) {
+                prefetch_code_line(pf_block << LOG2_BLOCK_SIZE);
+                iprefFilterInsert(pf_block);
+              }
+            }
+            count++;
+            predEntry.vector[k] = predEntry.vector[k] >> 1;
+          }
+        }
+      }
+    }
+
+    // Prepare for a new record
+    for (k = 0; k < IPREF_NUM_REGIONS_PER_ENTRY; k++) {
+      updateEntry.vector[k] = 0;
+    }
+    if (branch_target) {
+      // Follow branch target to start a new region
+      current_region_valid = true;
+      current_region =
+          branch_target >> (LOG2_BLOCK_SIZE + IPREF_LOG_REGION_SIZE);
+      updateEntry.lower_target[0] = current_region & IPREF_TARGET_MASK;
+      updateEntry.upper_target_pointer[0] =
+          iprefDictionaryAllocate(current_region >> IPREF_TARGET_BITS);
+      updateEntry.vector[0] =
+          1 << ((branch_target >> LOG2_BLOCK_SIZE) & IPREF_REGION_MASK);
+    } else if ((iprefRAStop < IPREF_RAS_SIZE) &&
+               iprefRAS[iprefRAStop]) { // Use RAS to get a predicted target
+      current_region_valid = true;
+      current_region =
+          iprefRAS[iprefRAStop] >> (LOG2_BLOCK_SIZE + IPREF_LOG_REGION_SIZE);
+      updateEntry.lower_target[0] = current_region & IPREF_TARGET_MASK;
+      updateEntry.upper_target_pointer[0] =
+          iprefDictionaryAllocate(current_region >> IPREF_TARGET_BITS);
+      updateEntry.vector[0] =
+          1 << ((iprefRAS[iprefRAStop] >> LOG2_BLOCK_SIZE) & IPREF_REGION_MASK);
+    } else
+      current_region_valid = false;
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit,
+                                          uint8_t prefetch_hit) {}
+
+void O3_CPU::l1i_prefetcher_cycle_operate() {}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_v_addr) {}
+
+void O3_CPU::l1i_prefetcher_final_stats() {}

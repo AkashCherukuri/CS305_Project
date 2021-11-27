@@ -1,0 +1,94 @@
+#include "ooo_cpu.h"
+
+#define DEGREE 20
+
+uint32_t prev_pos = 0;
+
+void O3_CPU::l1i_prefetcher_initialize() {
+  cout << "FDIP Prefetcher at L1I" << endl;
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type,
+                                           uint64_t branch_target) {}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit,
+                                          uint8_t prefetch_hit) {}
+
+void O3_CPU::l1i_prefetcher_cycle_operate() {
+  /*int pq_sent = 0;
+  if(prev_pos <= FTQ.tail)
+  {
+          for(int i = prev_pos; i <= FTQ.tail; i++)
+          {
+                  if(FTQ.entry[i].size() == 0)
+                          continue;
+
+                  prev_pos = i;
+
+                  if(FTQ.entry[i][0].fetched == 0)
+                  {
+                          prefetch_code_line(FTQ.entry[i][0].ip);
+                          pq_sent++;
+                  }
+
+                  if(pq_sent >= DEGREE)
+                          break;
+          }
+  }
+  else
+  {
+          for(int i = prev_pos; i < FTQ.SIZE && pq_sent < DEGREE;	i++)
+          {
+                  if(FTQ.entry[i].size() == 0)
+                          continue;
+
+                  prev_pos = i;
+
+                  if(FTQ.entry[i][0].fetched == 0)
+                  {
+                          prefetch_code_line(FTQ.entry[i][0].ip);
+                          pq_sent++;
+                  }
+
+          }
+          for(int i = 0; i <= FTQ.tail && pq_sent < DEGREE;	i++)
+          {
+                  if(FTQ.entry[i].size() == 0)
+                          continue;
+
+                  prev_pos = i;
+
+                  if(FTQ.entry[i][0].fetched == 0)
+                  {
+                          prefetch_code_line(FTQ.entry[i][0].ip);
+                          pq_sent++;
+                  }
+          }
+  }*/
+
+  if (FTQ.tail - DEGREE >= 0) {
+    for (int i = FTQ.tail - DEGREE; i <= FTQ.tail; i++) {
+      if (FTQ.entry[i].size() == 0)
+        continue;
+
+      if (FTQ.entry[i][0].fetched == 0) {
+        prefetch_code_line(FTQ.entry[i][0].ip);
+      }
+    }
+  } else {
+    for (int i = 0; i <= FTQ.tail; i++) {
+      if (FTQ.entry[i].size() == 0)
+        continue;
+
+      if (FTQ.entry[i][0].fetched == 0) {
+        prefetch_code_line(FTQ.entry[i][0].ip);
+      }
+    }
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_v_addr) {}
+
+void O3_CPU::l1i_prefetcher_final_stats() {}

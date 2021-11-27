@@ -1,0 +1,328 @@
+#include "ooo_cpu.h"
+
+// Size of a region (in terms of number of contiguous cache blocks)
+#define IPREF_LOG_REGION_SIZE 3
+#define IPREF_REGION_SIZE (1 << IPREF_LOG_REGION_SIZE)
+
+// Lower target length in history buffer entry
+#define IPREF_TARGET_BITS 14
+#define IPREF_TARGET_MASK ((1 << IPREF_TARGET_BITS) - 1)
+
+// Size of pointer to history buffer entry
+#define IPREF_HISTORY_POINTER_BITS 15
+
+// Number of history buffer entries
+#define IPREF_HISTORY_BUFFER_SIZE (28 * 1024)
+
+// Index table configuration
+#define IPREF_LOG_INDEX_TABLE_SETS 9
+#define IPREF_INDEX_TABLE_SETS (1 << IPREF_LOG_INDEX_TABLE_SETS)
+#define IPREF_INDEX_TABLE_WAYS 16
+
+// Upper target pointer size in history buffer entry
+#define IPREF_UPPER_TARGET_POINTER_BITS 5
+
+// Number of dictionary entries
+#define IPREF_UPPER_TARGET_DICTIONARY_SIZE                                     \
+  (1 << IPREF_UPPER_TARGET_POINTER_BITS)
+
+// Number of history buffer entries traversed for each prefetch trigger
+#define IPREF_LOOKAHEAD 12
+
+// Partial tag length used in index table entry
+#define IPREF_TAG_BITS 13
+#define IPREF_TAG_MASK ((1 << IPREF_TAG_BITS) - 1)
+
+// Dictionary entry; size = 50 bits
+class IPREF_DictionaryEntry {
+public:
+  uint64_t upper_target; // 44 bits
+  uint64_t lru;          //  5 bits
+  bool valid;            //  1 bit
+};
+
+IPREF_DictionaryEntry iprefDictionary[IPREF_UPPER_TARGET_DICTIONARY_SIZE];
+
+// Allocate a new target in dictionary if not already present
+static uint32_t iprefDictionaryAllocate(uint64_t upper_target) {
+  uint8_t i;
+
+  for (i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++) {
+    if (iprefDictionary[i].valid &&
+        (iprefDictionary[i].upper_target == upper_target)) {
+      // Hit
+      break;
+    }
+  }
+
+  if (i == IPREF_UPPER_TARGET_DICTIONARY_SIZE) {
+    // Miss: replace, allocate
+    for (i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++) {
+      if (!iprefDictionary[i].valid)
+        break;
+    }
+    if (i == IPREF_UPPER_TARGET_DICTIONARY_SIZE) {
+      uint64_t maxlru = 0;
+      int index = -1;
+      for (i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++) {
+        if (iprefDictionary[i].lru > maxlru) {
+          maxlru = iprefDictionary[i].lru;
+          index = i;
+        }
+      }
+      i = index;
+    }
+    iprefDictionary[i].upper_target = upper_target;
+    iprefDictionary[i].valid = true;
+  }
+
+  for (uint8_t j = 0; j < IPREF_UPPER_TARGET_DICTIONARY_SIZE; j++)
+    iprefDictionary[j].lru++;
+  iprefDictionary[i].lru = 0;
+
+  return i;
+}
+
+// Update LRU state of dictionary on a read
+static void iprefDictionaryUpdateLRUState(uint8_t read_index) {
+  for (uint8_t j = 0; j < IPREF_UPPER_TARGET_DICTIONARY_SIZE; j++)
+    iprefDictionary[j].lru++;
+  iprefDictionary[read_index].lru = 0;
+}
+
+// History buffer entry; size=27 bits
+class PIF_HistoryBufferEntry {
+public:
+  uint32_t lower_target;        // 14 bits
+  uint8_t upper_target_pointer; //  5 bits
+  uint8_t vector;               //  8 bits
+};
+
+PIF_HistoryBufferEntry
+    pifHistoryBuffer[IPREF_HISTORY_BUFFER_SIZE]; // size=27*28K bits=94.5 KB
+uint32_t historyBufferWP;                        // size=15 bits
+
+// Index table entry; size=33 bits
+class PIF_IndexTableEntry {
+public:
+  uint32_t tag;             // 13 bits
+  uint32_t history_pointer; // 15 bits
+  uint64_t lru;             //  4 bits
+  bool valid;               //  1 bit
+};
+
+PIF_IndexTableEntry
+    pifIndexTable[IPREF_INDEX_TABLE_SETS]
+                 [IPREF_INDEX_TABLE_WAYS]; // size = 33*512*16 bits = 33 KB
+
+// Look up index table with a region address to retrieve a history buffer
+// pointer
+static bool IndexTableLookup(uint64_t ip, uint32_t *pointer) {
+  uint32_t indexTableIndex = ip & (IPREF_INDEX_TABLE_SETS - 1);
+  uint64_t indexTableTag = (ip >> IPREF_LOG_INDEX_TABLE_SETS) & IPREF_TAG_MASK;
+  uint32_t i;
+
+  for (i = 0; i < IPREF_INDEX_TABLE_WAYS; i++) {
+    if (pifIndexTable[indexTableIndex][i].valid &&
+        (pifIndexTable[indexTableIndex][i].tag == indexTableTag)) {
+      // Hit
+      (*pointer) = pifIndexTable[indexTableIndex][i].history_pointer;
+      for (uint32_t j = 0; j < IPREF_INDEX_TABLE_WAYS; j++)
+        pifIndexTable[indexTableIndex][j].lru++;
+      pifIndexTable[indexTableIndex][i].lru = 0;
+      return true;
+    }
+  }
+
+  // Miss
+  return false;
+}
+
+// Allocate a new index table entry
+static void IndexTableAllocate(uint64_t ip, uint32_t pointer) {
+  uint32_t indexTableIndex = ip & (IPREF_INDEX_TABLE_SETS - 1);
+  uint64_t indexTableTag = (ip >> IPREF_LOG_INDEX_TABLE_SETS) & IPREF_TAG_MASK;
+  uint32_t i;
+
+  for (i = 0; i < IPREF_INDEX_TABLE_WAYS; i++) {
+    if (pifIndexTable[indexTableIndex][i].valid &&
+        (pifIndexTable[indexTableIndex][i].tag == indexTableTag)) {
+      // Hit: just update the history buffer pointer to the latest history
+      // buffer entry
+      pifIndexTable[indexTableIndex][i].history_pointer = pointer;
+      break;
+    }
+  }
+  if (i == IPREF_INDEX_TABLE_WAYS) {
+    // Miss: replace, allocate
+    for (i = 0; i < IPREF_INDEX_TABLE_WAYS; i++) {
+      if (!pifIndexTable[indexTableIndex][i].valid)
+        break;
+    }
+    if (i == IPREF_INDEX_TABLE_WAYS) {
+      uint64_t maxlru = 0;
+      uint32_t index = IPREF_INDEX_TABLE_WAYS;
+      for (i = 0; i < IPREF_INDEX_TABLE_WAYS; i++) {
+        if (pifIndexTable[indexTableIndex][i].lru > maxlru) {
+          maxlru = pifIndexTable[indexTableIndex][i].lru;
+          index = i;
+        }
+      }
+      i = index;
+    }
+    assert(i < IPREF_INDEX_TABLE_WAYS);
+    pifIndexTable[indexTableIndex][i].tag = indexTableTag;
+    pifIndexTable[indexTableIndex][i].history_pointer = pointer;
+    pifIndexTable[indexTableIndex][i].valid = true;
+  }
+  for (uint32_t j = 0; j < IPREF_INDEX_TABLE_WAYS; j++)
+    pifIndexTable[indexTableIndex][j].lru++;
+  pifIndexTable[indexTableIndex][i].lru = 0;
+}
+
+// Recent access filter entry; size = 59 bits
+class IPrefFilterEntry {
+public:
+  bool valid;   //  1 bit
+  uint64_t tag; // 58 bits
+};
+
+IPrefFilterEntry iprefFilter[IPREF_LOOKAHEAD * IPREF_REGION_SIZE];
+uint8_t iprefFilterTailPtr;
+
+// Search for a block address in the recent access filter
+static bool iprefFilterLookup(uint64_t block_addr) {
+  for (int i = 0; i < IPREF_LOOKAHEAD * IPREF_REGION_SIZE; i++) {
+    if (iprefFilter[i].valid && (iprefFilter[i].tag == block_addr))
+      return true;
+  }
+  return false;
+}
+
+// Enqueue a new block address at the tail
+static void iprefFilterInsert(uint64_t block_addr) {
+  iprefFilter[iprefFilterTailPtr].tag = block_addr;
+  iprefFilter[iprefFilterTailPtr].valid = true;
+  iprefFilterTailPtr =
+      (iprefFilterTailPtr + 1) % (IPREF_LOOKAHEAD * IPREF_REGION_SIZE);
+}
+
+uint64_t last_ip_block;
+bool last_ip_block_valid;
+uint64_t current_region; // current region being recorded
+
+void O3_CPU::l1i_prefetcher_initialize() {
+  last_ip_block_valid = false;
+
+  historyBufferWP = 0;
+
+  for (uint32_t i = 0; i < IPREF_INDEX_TABLE_SETS; i++)
+    for (uint32_t j = 0; j < IPREF_INDEX_TABLE_WAYS; j++)
+      pifIndexTable[i][j].valid = false;
+
+  for (uint32_t i = 0; i < IPREF_UPPER_TARGET_DICTIONARY_SIZE; i++)
+    iprefDictionary[i].valid = false;
+
+  for (uint32_t i = 0; i < IPREF_LOOKAHEAD * IPREF_REGION_SIZE; i++)
+    iprefFilter[i].valid = false;
+
+  iprefFilterTailPtr = 0;
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type,
+                                           uint64_t branch_target) {}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t addr, uint8_t cache_hit,
+                                          uint8_t prefetch_hit) {
+  uint64_t ip_block = addr >> LOG2_BLOCK_SIZE;
+  uint32_t pointer;
+  uint8_t vector;
+  uint64_t pf_region;
+
+  if (!last_ip_block_valid || (last_ip_block != ip_block)) {
+    if (!last_ip_block_valid) {
+      // Start a new region in the tail entry of the history buffer
+      pifHistoryBuffer[historyBufferWP].lower_target =
+          (ip_block >> IPREF_LOG_REGION_SIZE) & IPREF_TARGET_MASK;
+      pifHistoryBuffer[historyBufferWP].upper_target_pointer =
+          iprefDictionaryAllocate(ip_block >>
+                                  (IPREF_LOG_REGION_SIZE + IPREF_TARGET_BITS));
+      pifHistoryBuffer[historyBufferWP].vector =
+          1 << (ip_block & (IPREF_REGION_SIZE - 1));
+      current_region = ip_block >> IPREF_LOG_REGION_SIZE;
+    } else {
+      // A region is being recorded
+      if (current_region == (ip_block >> IPREF_LOG_REGION_SIZE)) {
+        // Current block falls in the region being recorded currently in history
+        // buffer tail entry
+        pifHistoryBuffer[historyBufferWP].vector =
+            pifHistoryBuffer[historyBufferWP].vector |
+            (1 << (ip_block & (IPREF_REGION_SIZE - 1)));
+      } else {
+        // A new region starts
+        // Close the currently recorded region by setting up an index table
+        // entry and advancing the history buffer tail pointer
+        IndexTableAllocate(current_region, historyBufferWP);
+        historyBufferWP = (historyBufferWP + 1) % IPREF_HISTORY_BUFFER_SIZE;
+
+        // Start a new region in the tail entry of the history buffer
+        pifHistoryBuffer[historyBufferWP].lower_target =
+            (ip_block >> IPREF_LOG_REGION_SIZE) & IPREF_TARGET_MASK;
+        pifHistoryBuffer[historyBufferWP].upper_target_pointer =
+            iprefDictionaryAllocate(
+                ip_block >> (IPREF_LOG_REGION_SIZE + IPREF_TARGET_BITS));
+        pifHistoryBuffer[historyBufferWP].vector =
+            1 << (ip_block & (IPREF_REGION_SIZE - 1));
+        current_region = ip_block >> IPREF_LOG_REGION_SIZE;
+
+        // Inject prefetches by looking up the index table and finding the
+        // pointer to the latest matching history buffer entry
+        if (IndexTableLookup(current_region, &pointer)) {
+          for (int i = 0; i < IPREF_LOOKAHEAD; i++) {
+            // Go over n consecutive history buffer entries starting from the
+            // returned pointer where n is IPREF_LOOKAHEAD and inject prefetches
+            pf_region =
+                (iprefDictionary[pifHistoryBuffer[pointer].upper_target_pointer]
+                     .upper_target
+                 << IPREF_TARGET_BITS) |
+                pifHistoryBuffer[pointer].lower_target;
+            iprefDictionaryUpdateLRUState(
+                pifHistoryBuffer[pointer].upper_target_pointer);
+            vector = pifHistoryBuffer[pointer].vector;
+            if (i == 0) { // Should not prefetch the demanded block
+              vector =
+                  vector & ~(1ULL << ((ip_block & (IPREF_REGION_SIZE - 1))));
+            }
+            uint8_t count = 0;
+            while (vector != 0) {
+              if ((vector & 0x1) != 0) {
+                if (!iprefFilterLookup(
+                        ((pf_region << IPREF_LOG_REGION_SIZE) + count))) {
+                  prefetch_code_line(
+                      ((pf_region << IPREF_LOG_REGION_SIZE) + count)
+                      << LOG2_BLOCK_SIZE);
+                  iprefFilterInsert(
+                      ((pf_region << IPREF_LOG_REGION_SIZE) + count));
+                }
+              }
+              count++;
+              vector = vector >> 1;
+            }
+            pointer = (pointer + 1) % IPREF_HISTORY_BUFFER_SIZE;
+          }
+        }
+      }
+    }
+  }
+
+  last_ip_block = ip_block;
+  last_ip_block_valid = true;
+}
+
+void O3_CPU::l1i_prefetcher_cycle_operate() {}
+
+void O3_CPU::l1i_prefetcher_final_stats() {}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_v_addr) {}

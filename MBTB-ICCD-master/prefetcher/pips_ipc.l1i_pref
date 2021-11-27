@@ -1,0 +1,392 @@
+#include "ooo_cpu.h"
+
+//#######################################################################################
+//             prefetcher parameters
+//#######################################################################################
+
+#define LHT_LOGSETS 10
+#define LHT_NUMWAYS 10
+#define LHT_RPBITS 3
+
+#define SCC_LOGSETS 5
+#define SCC_NUMWAYS 4
+#define SCC_RPBITS 2
+
+#define TAGBITS 16
+#define OFFSETBITS 22
+#define NTARGETS 3
+#define CBITS 4
+#define NSCOUTS 4
+#define NLWINDOW 4
+#define PQTHRESHOLD 7
+
+//#define USE_RNG
+
+#define CMAX ((1 << CBITS) - 1)
+
+//#######################################################################################
+//             some useful functions
+//#######################################################################################
+
+uint64_t truncate(uint64_t x, int nbits) {
+  if (nbits == 64)
+    return x;
+  assert(nbits < 64);
+  return x & ((((uint64_t)1) << nbits) - 1);
+}
+
+int64_t sign_extend(uint64_t x, int nbits) {
+  assert((x >> nbits) == 0);
+  int64_t m = ((int64_t)1) << (nbits - 1);
+  return (x ^ m) - m;
+}
+
+#ifdef USE_RNG
+uint32_t xorshift() {
+  // a simple RNG
+  static uint32_t x = 0xDEADBEEF;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  return x;
+}
+#endif
+
+//#######################################################################################
+//             LHT/SCC entry
+//#######################################################################################
+
+class LHT_ENTRY {
+public:
+  uint64_t offset[NTARGETS];
+  int c[NTARGETS + 1]; // last frequency count is for fall-through line
+
+  static int size() {
+    int nbits = NTARGETS * OFFSETBITS + (NTARGETS + 1) * CBITS;
+    return nbits;
+  }
+
+  LHT_ENTRY() { reset(); }
+
+  void reset() {
+    for (int i = 0; i < NTARGETS; i++)
+      offset[i] = 0;
+    for (int i = 0; i <= NTARGETS; i++)
+      c[i] = 0;
+  }
+
+  uint64_t get_offset(uint64_t line, uint64_t nextline) {
+    int64_t diff = nextline - line;
+    uint64_t os = truncate(diff, OFFSETBITS);
+    if (sign_extend(os, OFFSETBITS) != diff)
+      os = 0;
+    return os;
+  }
+
+  uint64_t get_successor(uint64_t line, int i) {
+    assert(i <= NTARGETS);
+    if (i == NTARGETS)
+      return line + 1;
+    if (!offset[i])
+      return 0;
+    return line + sign_extend(offset[i], OFFSETBITS);
+  }
+
+  int victim_offset() {
+    int v = -1;
+    for (int i = 0; i < NTARGETS; i++) {
+      if (!offset[i])
+        return i;
+      if ((v < 0) || (c[i] < c[v]))
+        v = i;
+    }
+    return v;
+  }
+
+  void update(uint64_t line, uint64_t nextline) {
+    uint64_t os = get_offset(line, nextline);
+    if (os == 0)
+      return;
+    int j = -1;
+    if (os == 1) { // fall-through line
+      j = NTARGETS;
+    } else {
+      for (int i = 0; i < NTARGETS; i++) {
+        if (os == offset[i]) { // offset already recorded
+          j = i;
+          break;
+        }
+      }
+      if (j < 0) {
+        // new offset
+        j = victim_offset();
+        offset[j] = os;
+        c[j] = 0;
+      }
+    }
+    // update frequency counts
+    assert((j >= 0) && (c[j] <= CMAX));
+    if (c[j] == CMAX) {
+      for (int i = 0; i <= NTARGETS; i++)
+        c[i] >>= 1;
+    }
+    c[j]++;
+  }
+
+#ifdef USE_RNG
+  // for documentation, not used in the submitted prefetcher
+  uint64_t select_successor(uint64_t line) {
+    int sum = 0;
+    for (int i = 0; i <= NTARGETS; i++)
+      sum += c[i];
+    if (!sum)
+      return 0;
+    int r = xorshift() % sum;
+    int s = 0;
+    for (int i = 0; i <= NTARGETS; i++) {
+      s += c[i];
+      if (r < s)
+        return get_successor(line, i);
+    }
+    assert(0);
+  }
+#else
+  // selection method used in the submitted prefetcher
+  uint64_t select_successor(uint64_t line) {
+    int k = 0;
+    for (int i = 1; i <= NTARGETS; i++) {
+      if (c[i] > c[k])
+        k = i;
+    }
+    if (!c[k])
+      return 0; // all counts zeroed, entry is now a barrier
+    c[k]--;
+    return get_successor(line, k);
+  }
+#endif
+};
+
+//#######################################################################################
+//           Line History Table and Scouting Cache
+//#######################################################################################
+
+class LINE_HISTORY_TABLE {
+public:
+  const int lset;
+  const int nway;
+  const int rbits;
+  int n;    // total number of entries
+  int rmax; // max rp value
+  uint64_t *tag;
+  LHT_ENTRY *e;
+  int *rp; // replacement policy bits
+
+  int size() {
+    int nbits = LHT_ENTRY::size() + TAGBITS + rbits;
+    nbits *= n;
+    return nbits;
+  }
+
+  LINE_HISTORY_TABLE(int logset, int numway, int rpbits)
+      : lset(logset), nway(numway), rbits(rpbits) {
+    n = nway << lset;
+    rmax = (1 << rbits) - 1;
+    tag = new uint64_t[n];
+    e = new LHT_ENTRY[n];
+    rp = new int[n];
+    for (int i = 0; i < n; i++) {
+      tag[i] = 0;
+      rp[i] = rmax;
+    }
+  }
+
+  ~LINE_HISTORY_TABLE() {
+    delete[] tag;
+    delete[] e;
+    delete[] rp;
+  }
+
+  int set_index(uint64_t line) { return truncate(line, lset); }
+
+  uint64_t tag_hash(uint64_t line) { return truncate(line >> lset, TAGBITS); }
+
+  int search(int i, uint64_t t) {
+    assert((i >= 0) && (i <= (n - nway)));
+    for (int j = i; j < (i + nway); j++) {
+      if (tag[j] == t)
+        return j;
+    }
+    return -1;
+  }
+
+  int get_victim(int i) {
+    // SRRIP (Jaleel et al, ISCA 2010)
+    int v = -1;
+    while (v < 0) {
+      for (int j = i; j < (i + nway); j++) {
+        if (rp[j] == rmax) {
+          v = j;
+          break;
+        }
+      }
+      if (v < 0) {
+        for (int j = i; j < (i + nway); j++) {
+          assert(rp[j] < rmax);
+          rp[j]++;
+        }
+      }
+    }
+    assert(v >= 0);
+    return v;
+  }
+
+  LHT_ENTRY &get_entry(uint64_t line) {
+    int i = set_index(line) * nway;
+    uint64_t t = tag_hash(line);
+    int j = search(i, t);
+    if (j >= 0) {
+      // hit
+      rp[j] = 0;
+    } else {
+      // miss
+      j = get_victim(i);
+      rp[j] = rmax - 1;
+      tag[j] = t;
+      e[j].reset();
+    }
+    assert((j >= 0) && (j < n));
+    return e[j];
+  }
+
+  LHT_ENTRY *lookup(uint64_t line, bool update) {
+    int i = set_index(line) * nway;
+    uint64_t t = tag_hash(line);
+    int j = search(i, t);
+    if (j < 0)
+      return NULL; // miss
+    assert(j < n);
+    if (update)
+      rp[j] = 0;
+    return &e[j];
+  }
+};
+
+//#######################################################################################
+//           prefetcher state
+//#######################################################################################
+
+LINE_HISTORY_TABLE lht(LHT_LOGSETS, LHT_NUMWAYS,
+                       LHT_RPBITS); // Line History Table
+LINE_HISTORY_TABLE scc(SCC_LOGSETS, SCC_NUMWAYS, SCC_RPBITS); // Scouting Cache
+
+uint64_t frontline = 0;
+uint64_t prevline = 0;
+uint64_t scout[NSCOUTS] = {0};
+int ns = 0;
+
+//#######################################################################################
+//           prefetcher algorithm
+//#######################################################################################
+
+int new_scout() {
+  for (int i = 0; i < NSCOUTS; i++) {
+    if (!scout[i])
+      return i;
+  }
+  int s = ns;
+  ns = (ns + 1) % NSCOUTS;
+  return s;
+}
+
+LHT_ENTRY *lookup_scc(uint64_t line, bool &sccmiss) {
+  LHT_ENTRY *e = scc.lookup(line, true);
+  sccmiss = (e == NULL);
+  if (sccmiss) {
+    e = lht.lookup(line, false);
+    if (e) {
+      // copy LHT entry into SCC
+      LHT_ENTRY &ee = scc.get_entry(line);
+      ee = *e;
+      e = &ee;
+    }
+  }
+  return e;
+}
+
+void O3_CPU::l1i_prefetcher_initialize() {
+  printf("LHT KB: %.2f\n", (double)lht.size() / 8192);
+  printf("SCC KB: %.2f\n", (double)scc.size() / 8192);
+  printf("Total KB: %.2f\n", (double)(lht.size() + scc.size()) / 8192);
+  // frontline, prevline, scout[4], and ns are not printed in the total
+  // they amount to 58 + 58 + 4*58 + 2 = 350 bits (< 44 bytes)
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type,
+                                           uint64_t branch_target) {
+  // Initially, I wanted the front line to be defined at the branch prediction
+  // stage. However, branch_operate is not called for lines containing no
+  // branch. Below is a hack not described in the paper, for slightly higher
+  // IPCs:
+  if (branch_target) {
+    prefetch_code_line(branch_target);
+    scout[new_scout()] = branch_target >> LOG2_BLOCK_SIZE;
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit,
+                                          uint8_t prefetch_hit) {
+  // front line is updated here
+  frontline = v_addr >> LOG2_BLOCK_SIZE;
+  if (frontline == prevline)
+    return; // still in the same line
+  scout[new_scout()] =
+      frontline; // front line moves, kill and replace one scout
+
+  // LHT is updated non speculatively (should be at retirement)
+  if (prevline) {
+    LHT_ENTRY &e = lht.get_entry(prevline);
+    e.update(prevline, frontline);
+  }
+  prevline = frontline;
+}
+
+void O3_CPU::l1i_prefetcher_cycle_operate() {
+  if ((L1I.PQ.occupancy > PQTHRESHOLD) || !frontline) {
+    // ending condition, all the scouts die
+    for (int i = 0; i < NSCOUTS; i++)
+      scout[i] = 0;
+    return;
+    // new scouts will be sent when prefetch queue drains
+  }
+
+  for (int i = 0; i < NSCOUTS; i++) {
+    if (!scout[i])
+      scout[i] = frontline; // new scout, starts from front line
+    bool sccmiss;
+    LHT_ENTRY *e = lookup_scc(scout[i], sccmiss);
+    if (e && sccmiss) {
+      // Upon SCC miss, prefetch all successors with non-null frequency count
+      // (slightly different from description in the paper, makes little
+      // difference).
+      for (int j = NTARGETS; j >= 0; j--) {
+        if (e->c[j]) {
+          prefetch_code_line(e->get_successor(scout[i], j) << LOG2_BLOCK_SIZE);
+        }
+      }
+    } else if (sccmiss && (scout[i] >= frontline) &&
+               (scout[i] < (frontline + NLWINDOW))) {
+      // SCC miss and LHT miss, use next-line prefetching
+      scout[i]++;
+      prefetch_code_line(scout[i] << LOG2_BLOCK_SIZE);
+    }
+    if (e)
+      scout[i] =
+          e->select_successor(scout[i]); // probabilistic scouting is here
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_v_addr) {}
+
+void O3_CPU::l1i_prefetcher_final_stats() {}

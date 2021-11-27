@@ -1,0 +1,497 @@
+/* vim: set filetype=cpp: */
+
+/***
+ * Temporal Ancestry Predictor
+ */
+
+#include "champsim.h"
+#include "ooo_cpu.h"
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+/**
+ * Configuration constants
+ */
+const std::size_t HISTORY_LEN = 14;
+const std::size_t DESC_LEN = 9;
+const std::size_t LOG2_TABLE_ROWS = 12;
+const std::size_t COUNTER_BITS = 6;
+const std::size_t GBL_COUNTER_BITS = 11;
+const double ISSUE_THRESH = 0.005;
+const std::size_t PAGE_T_BUF_SIZE = 1 << 11;
+const unsigned int PAGE_T_SHAMT = (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE);
+const std::size_t SHADOW_CACHE_BITS = 12;
+
+/**
+ * Type definitions
+ */
+using addr_t = uint64_t;
+using weight_t = int64_t;
+
+struct page_translation_buffer_node_t {
+  bool nru = false;
+  bool valid = false;
+  addr_t address = 0;
+};
+using page_translation_buffer_t =
+    std::array<page_translation_buffer_node_t, PAGE_T_BUF_SIZE>;
+
+struct descendency_node_t {
+  bool valid = false;
+  std::size_t idx = 0;
+  unsigned int offset = 0;
+  weight_t weight = 0;
+
+  friend bool operator<(const descendency_node_t &lhs,
+                        const descendency_node_t &rhs) {
+    // Invalid ways always evaluate least
+    return !lhs.valid || (rhs.valid && lhs.weight < rhs.weight);
+  }
+};
+using descendency_t = std::vector<descendency_node_t>;
+
+struct ancestry_table_node_t {
+  descendency_t desc;
+  bool visited = false;
+};
+using table_t = std::unordered_map<addr_t, ancestry_table_node_t>;
+
+/*
+ * Forward declarations
+ */
+unsigned long long hashint(unsigned long long a);
+std::size_t _nbits(const std::size_t x);
+std::vector<addr_t> follow_path_dfs(const addr_t block_addr,
+                                    const double scale_factor = 1,
+                                    const std::size_t depth = 0);
+std::pair<bool, descendency_t::iterator>
+find_or_inc(const addr_t block_addr, const uint64_t value, const int inc = 0,
+            const bool replace = false);
+std::pair<std::size_t, unsigned int> addr_to_idx(const addr_t block_addr);
+addr_t to_v_addr(const std::size_t idx, const unsigned int offset);
+uint64_t get_table_row(const addr_t val);
+std::pair<addr_t, unsigned int> region_offset(const addr_t block_addr);
+
+struct shadow_cache_filter {
+  struct shadow_cache_filter_node_t {
+    bool valid = false;
+    bool useful = false;
+    bool prefetch = false;
+    addr_t address = 0;
+    unsigned int lru = L1I_WAY;
+
+    friend bool operator<(const shadow_cache_filter_node_t &lhs,
+                          const shadow_cache_filter_node_t &rhs) {
+      // Invalid ways always evaluate LRU
+      return lhs.valid && (!rhs.valid || lhs.lru < rhs.lru);
+    }
+  };
+
+  using cache_t =
+      std::array<std::array<shadow_cache_filter_node_t, L1I_WAY>, L1I_SET>;
+  const std::size_t nbits;
+  const unsigned long long bitmask;
+  cache_t shadow_cache;
+
+  shadow_cache_filter(std::size_t nbits)
+      : nbits(nbits), bitmask(((1 << nbits) - 1) << _nbits(L1I_SET)) {}
+  bool check_useful(const addr_t block_addr);
+  std::pair<bool, unsigned int>
+  access(const addr_t block_addr, bool update = false, bool prefetch = false);
+};
+
+/**
+ * Metadata structures
+ */
+std::deque<addr_t> history_buffer;
+table_t ancestry_table;
+page_translation_buffer_t page_translation_buffer;
+shadow_cache_filter pref_cache(SHADOW_CACHE_BITS);
+uint32_t pf_issued = 0, pf_useful = 0;
+
+/**
+ * Derived constants
+ */
+const weight_t MAX_WEIGHT = (1 << COUNTER_BITS) - 1;
+const weight_t MIN_WEIGHT = 0;
+const uint32_t MAX_GBL_COUNTER = (1 << GBL_COUNTER_BITS) - 1;
+
+/**
+ * Functor detecting the valid field
+ */
+template <typename T> struct is_valid {
+  bool operator()(const typename T::value_type &test) { return test.valid; }
+};
+
+/**
+ * Functor detecting a particular value in the address field
+ */
+template <typename T> struct eq_addr {
+  const addr_t val;
+  eq_addr(addr_t val) : val(val) {}
+  bool operator()(const typename T::value_type &test) {
+    is_valid<T> validtest;
+    return validtest(test) && test.address == val;
+  }
+};
+
+/**
+ * A specialization of eq_addr for descendency lists
+ * because they do not have addresses, but (idx, offset) pairs.
+ */
+template <> struct eq_addr<descendency_t> {
+  std::size_t idx;
+  unsigned int offset;
+  bool matchnone;
+  eq_addr(const addr_t val) {
+    addr_t page_addr;
+    std::tie(page_addr, offset) = region_offset(val);
+    auto it = std::find_if(
+        page_translation_buffer.begin(), page_translation_buffer.end(),
+        eq_addr<page_translation_buffer_t>(
+            page_addr)); // sneakly read the translation buffer
+    matchnone = (it == page_translation_buffer
+                           .end()); // The page is not in the translation buffer
+    idx = std::distance(page_translation_buffer.begin(), it);
+  }
+  bool operator()(const descendency_t::value_type &test) {
+    if (matchnone)
+      return false;
+    return test.valid && test.idx == idx && test.offset == offset;
+  }
+};
+
+/**
+ * The number of bits required to represent a value
+ */
+std::size_t _nbits(const std::size_t x) {
+  return (std::size_t)std::ceil(std::log2(x));
+}
+
+/**
+ * Jenkins hash function
+ */
+unsigned long long hashint(unsigned long long a) {
+  a += ~(a << 15);
+  a ^= (a >> 10);
+  a += (a << 3);
+  a ^= (a >> 6);
+  a += ~(a << 11);
+  a ^= (a >> 16);
+  return a;
+}
+
+/**
+ * Separate an address into a (page, offset) pair
+ */
+std::pair<addr_t, unsigned int> region_offset(const addr_t block_addr) {
+  addr_t page_addr = block_addr >> PAGE_T_SHAMT;
+  unsigned int offset = block_addr & ((1 << PAGE_T_SHAMT) - 1);
+  return std::make_pair(page_addr, offset);
+}
+
+/**
+ * The method for getting the row in the table to address
+ */
+uint64_t get_table_row(const addr_t val) {
+  return hashint(val) % (1 << LOG2_TABLE_ROWS);
+}
+
+/**
+ * Check usefulness in the shadow cache
+ */
+bool shadow_cache_filter::check_useful(const addr_t block_addr) {
+  cache_t::value_type &set = shadow_cache.at(block_addr % L1I_SET);
+  const addr_t tag = hashint(block_addr >> _nbits(L1I_SET)) & bitmask;
+  auto it =
+      std::find_if(set.begin(), set.end(), eq_addr<cache_t::value_type>(tag));
+  return (it != set.end()) && (it->useful || !it->prefetch);
+}
+
+/**
+ * Access the shadow cache, optionally updating
+ */
+std::pair<bool, unsigned int>
+shadow_cache_filter::access(const addr_t block_addr, bool update,
+                            bool prefetch) {
+  cache_t::value_type &set = shadow_cache.at(block_addr % L1I_SET);
+  const addr_t tag = hashint(block_addr >> _nbits(L1I_SET)) & bitmask;
+  auto it =
+      std::find_if(set.begin(), set.end(), eq_addr<cache_t::value_type>(tag));
+
+  bool hit = it != set.end();
+  unsigned int lru = std::distance(set.begin(), it);
+
+  if (update) {
+    // find a replacement
+    if (!hit) {
+      it = std::max_element(set.begin(), set.end());
+    } else {
+      if (it->prefetch)
+        it->useful = true;
+    }
+    assert(it != set.end());
+
+    it->prefetch = prefetch;
+    it->valid = true;
+    it->address = tag;
+    for (auto &x : set) {
+      if (x.lru < it->lru)
+        x.lru++;
+    }
+    it->lru = 0;
+  }
+
+  return std::make_pair(hit, lru);
+}
+
+/**
+ * Look up an address in the page translation buffer
+ */
+std::pair<std::size_t, unsigned int> addr_to_idx(const addr_t block_addr) {
+  addr_t page_addr;
+  unsigned int offset;
+
+  std::tie(page_addr, offset) = region_offset(block_addr);
+
+  auto it = std::find_if(page_translation_buffer.begin(),
+                         page_translation_buffer.end(),
+                         eq_addr<page_translation_buffer_t>(page_addr));
+  if (it == page_translation_buffer.end()) {
+    it = std::find_if_not(page_translation_buffer.begin(),
+                          page_translation_buffer.end(),
+                          is_valid<page_translation_buffer_t>());
+    if (it == page_translation_buffer.end()) {
+      // Replace NRU
+      it = std::find_if(
+          page_translation_buffer.begin(), page_translation_buffer.end(),
+          [](page_translation_buffer_t::value_type x) { return x.nru; });
+      if (it == page_translation_buffer.end()) {
+        std::for_each(
+            page_translation_buffer.begin(), page_translation_buffer.end(),
+            [](page_translation_buffer_t::value_type &x) { x.nru = true; });
+        it = page_translation_buffer.begin();
+      }
+    }
+  }
+
+  it->address = page_addr;
+  it->valid = true;
+  it->nru = false;
+  return std::make_pair(std::distance(page_translation_buffer.begin(), it),
+                        offset);
+}
+
+/**
+ * Reconstruct an address from an (index, offset) pair
+ */
+addr_t to_v_addr(const std::size_t idx, const unsigned int offset) {
+  return (page_translation_buffer.at(idx).address << PAGE_T_SHAMT) | offset;
+}
+
+/**
+ * Convert a descendency_t::value_type into an address and its confidence
+ */
+std::pair<addr_t, double> addr_conf(const double factor, const weight_t sum,
+                                    const std::size_t depth,
+                                    const descendency_t::value_type &x) {
+  return std::make_pair(to_v_addr(x.idx, x.offset),
+                        factor * x.weight / (sum + depth));
+}
+
+/**
+ * Issue prefetches for all descendents, then possibly recur on the table
+ */
+std::vector<addr_t> follow_path_dfs(const addr_t block_addr,
+                                    const double scale_factor,
+                                    const std::size_t depth) {
+  table_t::mapped_type &node = ancestry_table[get_table_row(block_addr)];
+  descendency_t &container = node.desc;
+  std::vector<addr_t> retval;
+
+  bool is_empty = std::none_of(container.begin(), container.end(),
+                               is_valid<descendency_t>());
+  if (node.visited || is_empty ||
+      scale_factor <= ISSUE_THRESH) // Stop recursion if we have visited the
+                                    // node, it is empty, or it is unconfident
+  {
+    return retval;
+  }
+
+  // mark the row as visited
+  node.visited = true;
+  std::vector<addr_t> nextpath;
+
+  // Sum all of the weights in the row
+  std::vector<weight_t> weights;
+  std::transform(
+      container.begin(), container.end(), std::back_inserter(weights),
+      [](descendency_t::value_type y) { return y.valid ? y.weight : 0; });
+  weight_t sum = std::accumulate(weights.begin(), weights.end(), 0);
+  if (sum <= 0)
+    sum = 1;
+
+  // Depth First
+  for (auto it = container.begin(); it != container.end(); ++it) {
+    if (it->valid) {
+      double conf;
+      addr_t addr;
+      std::tie(addr, conf) = addr_conf(scale_factor, sum, depth, *it);
+      nextpath = follow_path_dfs(addr, conf, depth + 1);
+      retval.insert(retval.end(), nextpath.begin(), nextpath.end());
+    }
+  }
+
+  if (depth > 0)                  // don't add the initiating address
+    retval.push_back(block_addr); // postfix
+
+  return retval;
+}
+
+void rollover_weight(descendency_t::value_type &x) { x.weight >>= 1; }
+
+/**
+ * Find in the descendent list, replacing if needed, and incrementing counts if
+ * found Increment may be 0 or -1, in which case it is a no-op or a decrement
+ */
+std::pair<bool, descendency_t::iterator> find_or_inc(const addr_t block_addr,
+                                                     const uint64_t value,
+                                                     const int inc,
+                                                     const bool replace) {
+  descendency_t &container = ancestry_table[get_table_row(block_addr)].desc;
+  auto it = std::find_if(container.begin(), container.end(),
+                         eq_addr<descendency_t>(value));
+  bool hit = (it != container.end());
+
+  if (hit) {
+    it->weight += inc;
+    if (it->weight >= MAX_WEIGHT) {
+      std::for_each(container.begin(), container.end(), rollover_weight);
+    }
+    if (it->weight < MIN_WEIGHT) {
+      container.erase(it);
+    }
+  } else {
+    if (replace) {
+      descendency_t::value_type newval;
+      std::tie(newval.idx, newval.offset) = addr_to_idx(value);
+      newval.valid = true;
+      newval.weight = 0;
+
+      if (container.size() < DESC_LEN) {
+        container.insert(it, newval);
+      } else {
+        it = std::min_element(container.begin(), container.end());
+        *it = newval;
+      }
+    }
+  }
+
+  return std::make_pair(hit, it);
+}
+
+void clear_visitation_row(table_t::value_type &node) {
+  node.second.visited = false;
+}
+
+void O3_CPU::l1i_prefetcher_initialize() {
+  std::cout << "CPU " << cpu << " Temporal Ancestry L1I prefetcher"
+            << std::endl;
+}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit,
+                                          uint8_t prefetch_hit) {
+  addr_t curr_block_addr = v_addr >> LOG2_BLOCK_SIZE;
+  std::for_each(ancestry_table.begin(), ancestry_table.end(),
+                clear_visitation_row);
+  addr_t nextline_addr = (curr_block_addr) + 1;
+
+  // Track usefulness for confidence scaling
+  if (prefetch_hit)
+    pf_useful++;
+
+  // Update LRU in shadow cache on a hit
+  if (cache_hit) {
+    pref_cache.access(curr_block_addr, true, true);
+  }
+
+  // On cache miss, add PC as a descendent of the history
+  if (!cache_hit) {
+    for (auto hist_addr : history_buffer) {
+      if (hist_addr !=
+          nextline_addr) // Since we always prefetch next line, don't bother
+                         // adding it to the ancestry table
+        find_or_inc(hist_addr, curr_block_addr, +1, true);
+    }
+  }
+
+  std::vector<addr_t> path;
+
+  // Do next line prefetching too
+  path.push_back(nextline_addr);
+
+  // TAP examines path
+  std::vector<addr_t> nextpath =
+      follow_path_dfs(curr_block_addr, (double)pf_useful / pf_issued);
+  path.insert(path.end(), nextpath.begin(), nextpath.end());
+
+  // Prefetch down path
+  for (auto it = path.begin(); it != path.end(); ++it) {
+    bool filterhit = false;
+    std::tie(filterhit, std::ignore) = pref_cache.access(*it, false);
+    if (!filterhit) {
+      bool space_left = prefetch_code_line(*it << LOG2_BLOCK_SIZE);
+      if (space_left) {
+        if (pf_issued >= MAX_GBL_COUNTER) {
+          pf_issued >>= 1;
+          pf_useful >>= 1;
+        }
+        pf_issued++;
+      }
+    }
+  }
+
+  auto it = find(history_buffer.begin(), history_buffer.end(), curr_block_addr);
+  if (it ==
+      history_buffer.end()) // if the address is not found in the history buffer
+  {
+    while (history_buffer.size() >= HISTORY_LEN) {
+      history_buffer.pop_back();
+    }
+    history_buffer.push_front(curr_block_addr);
+  } else {
+    // Move to front of history
+    addr_t x = *it;
+    history_buffer.erase(it);
+    history_buffer.push_front(x);
+  }
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set,
+                                       uint32_t way, uint8_t prefetch,
+                                       uint64_t evicted_v_addr) {
+  // Update shadow cache
+  bool useful = pref_cache.check_useful(evicted_v_addr >> LOG2_BLOCK_SIZE);
+  if (!useful) {
+    for (auto hist_addr : history_buffer) {
+      find_or_inc(hist_addr, evicted_v_addr >> LOG2_BLOCK_SIZE, -1, false);
+    }
+  }
+  pref_cache.access(v_addr >> LOG2_BLOCK_SIZE, true, prefetch);
+}
+
+void O3_CPU::l1i_prefetcher_final_stats() {}
+void O3_CPU::l1i_prefetcher_cycle_operate() {}
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type,
+                                           uint64_t branch_target) {}
